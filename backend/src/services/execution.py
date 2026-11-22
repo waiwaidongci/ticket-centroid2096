@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from sqlalchemy import and_, or_, select
 from src.config.database import Session
 from src.constants.enums import Status
-from src.domain.analysis import analyze
+from src.domain.analysis import forecast_snapshot, summarize
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
@@ -65,7 +65,17 @@ def execute(lease):
     job_id, attempt, rows, params = lease
     result = export = failure = None
     try:
-        result = analyze(rows, params)
+        with Session.begin() as db:
+            job = db.get(Run, job_id, with_for_update=True)
+            if job.attempt != attempt or job.status != Status.RUNNING:
+                return
+            if job.checkpoint is None:
+                # 开跑时固定预测与预计件数；中断恢复沿用此快照，不重算预测。
+                job.checkpoint = forecast_snapshot(rows, params)
+                record(db, 'worker', 'analysis.snapshot', job.id, attempt=attempt)
+            checkpoint = dict(job.checkpoint)
+        result = summarize(checkpoint)
+        # 导出先写暂存再替换，且只在完成事务里改指；发布中断时保留下载旧版。
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]
